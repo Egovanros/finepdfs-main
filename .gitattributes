@@ -1,0 +1,2 @@
+models/heron/** filter=lfs diff=lfs merge=lfs
+models/xgb_ocr_classifier/** filter=lfs diff=lfs merge=lfs
