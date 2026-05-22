@@ -60,8 +60,9 @@ class RemoveDoclingMetadata(PipelineStep):
 
     def run(self, data: DocumentsPipeline, rank: int = 0, world_size: int = 1):
         for document in data:
-            if document.media and document.media[0].metadata and "docling_doc_dict" in document.media[0].metadata:
-                document.media[0].metadata.pop("docling_doc_dict")
+            if document.media and document.media[0].metadata:
+                for bulky in ("docling_doc_dict", "logs"):
+                    document.media[0].metadata.pop(bulky, None)
             yield document
 
 
@@ -195,7 +196,7 @@ async def rollout_postprocess(document: Document, generate: Any, **kwargs) -> An
     import atexit
 
     if not hasattr(rollout_postprocess, "process_pool"):
-        rollout_postprocess.process_pool = ProcessPoolExecutor(max_workers=4)
+        rollout_postprocess.process_pool = ProcessPoolExecutor(max_workers=1)
         atexit.register(rollout_postprocess.process_pool.shutdown)
 
     from .postprocess_utils import prepare_requests_postprocess as _prep

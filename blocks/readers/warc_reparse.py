@@ -1,9 +1,43 @@
 from datatrove.data import MediaType
 from datatrove.pipeline.readers.base import BaseDiskReader
 from datatrove.io import DataFolderLike, DataFileLike
+from datatrove.utils.logging import logger
 from typing import Callable, Literal
 from pandas import Timestamp
 from uuid import uuid4
+
+
+# Max bytes read per WARC record for MIME detection; larger payloads are marked truncated.
+WARC_RECORD_MAX_BYTES = 10 * 1024 * 1024
+
+def _transient_cc_read_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in ("503", "502", "504", "429", "service unavailable", "timed out")
+    )
+
+
+def normalize_cc_warc_path(filepath: str, stream_path: str | None = None) -> str:
+    """Path relative to Common Crawl root (crawl-data/...), for S3 and HTTPS."""
+    path = filepath.replace("\\", "/").lstrip("/")
+    if path.startswith("crawl-data/"):
+        return path
+    raw = (stream_path or path).replace("\\", "/")
+    for prefix in (
+        "https://data.commoncrawl.org/",
+        "http://data.commoncrawl.org/",
+        "s3://commoncrawl/",
+        "commoncrawl/",
+    ):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+    raw = raw.lstrip("/")
+    idx = raw.find("crawl-data/")
+    if idx >= 0:
+        return raw[idx:]
+    return path
+
 
 class WarcIndexReprocess(BaseDiskReader):
     """Read WARC files and extract metadata for indexing purposes.
@@ -72,19 +106,36 @@ class WarcIndexReprocess(BaseDiskReader):
     def read_file(self, filepath: str):
         from warcio.archiveiterator import ArchiveIterator
 
-        with self.data_folder.open(filepath, "rb") as f:
+        try:
+            f = self.data_folder.open(filepath, "rb")
+        except Exception as exc:
+            if _transient_cc_read_error(exc):
+                logger.warning(f"Could not open WARC {filepath}: {exc}")
+                return
+            raise
+
+        with f:
             archive_iterator = ArchiveIterator(f)
             for ri, record in enumerate(archive_iterator):
-                offset = archive_iterator.offset
-                with self.track_time():
-                    name = f.path[len("commoncrawl/"):]
-                    extracted_data = process_record(record, offset, name)
-                    if not extracted_data:
-                        continue
-                    document = self.get_document_from_dict(extracted_data, filepath, ri)
-                    if not document:
-                        continue
-                
+                try:
+                    offset = archive_iterator.offset
+                    with self.track_time():
+                        name = normalize_cc_warc_path(filepath, getattr(f, "path", None))
+                        extracted_data = process_record(record, offset, name)
+                        if not extracted_data:
+                            continue
+                        document = self.get_document_from_dict(extracted_data, filepath, ri)
+                        if not document:
+                            continue
+                except Exception as exc:
+                    if _transient_cc_read_error(exc):
+                        logger.warning(
+                            f"Common Crawl read stopped at record {ri} in {filepath}: {exc}. "
+                            "Continuing with records already read (retry the run later for more)."
+                        )
+                        break
+                    raise
+
                 yield document
 
 
@@ -106,7 +157,7 @@ def process_record(record: "ArcWarcRecord", offset: int, name: str) -> dict | No
         - fetch_time: Date of the record
         - content_mime_type: Original MIME type from headers
         - content_mime_detected: Detected MIME type
-        - content_truncated: Whether content was truncated (if >= 1MB)
+        - content_truncated: Set if payload exceeds WARC_RECORD_MAX_BYTES
         - warc_record_offset: Byte offset in the WARC file
         - warc_filename: Name of the WARC file
         - content_digest: Content digest hash if available
@@ -117,19 +168,18 @@ def process_record(record: "ArcWarcRecord", offset: int, name: str) -> dict | No
     if record.rec_type not in ["response", "conversion", "resource"]:  # wet files have "conversion" type
         return
 
-    # content type filtering
-    content_bytes = record.content_stream().read()
+    raw = record.content_stream().read(WARC_RECORD_MAX_BYTES + 1)
+    truncated = None
+    if len(raw) > WARC_RECORD_MAX_BYTES:
+        truncated = "length"
+        content_bytes = raw[:WARC_RECORD_MAX_BYTES]
+    else:
+        content_bytes = raw
 
     original_mime_type = record.content_type.split(";")[0]
     detected_mime_type = record.rec_headers.get("WARC-Identified-Payload-Type", None)
     if detected_mime_type is None:
         detected_mime_type = magic.from_buffer(content_bytes, mime=True)
-
-
-    truncated = None
-    # 1MB truncation
-    if len(content_bytes) >= 1024 * 1024:
-        truncated = "length"
 
     id_ = record.rec_headers["WARC-Record-ID"]
     url = record.rec_headers.get("WARC-Target-URI", None)

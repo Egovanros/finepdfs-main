@@ -1,6 +1,8 @@
 import asyncio
 import argparse
+import glob
 import os
+import sys
 from typing import Any, AsyncGenerator, Optional
 from pipeline_utils.language import SelectBestLanguage
 
@@ -17,7 +19,6 @@ from datatrove.pipeline.media.readers.http_fetch import HTTPFetchReader
 from datatrove.pipeline.media.media_writers.zstd import ZstdWriter
 from datatrove.pipeline.readers.jsonl import JsonlReader
 from datatrove.pipeline.readers.parquet import ParquetReader
-from datatrove.pipeline.writers import HuggingFaceDatasetWriter
 from datatrove.pipeline.writers.jsonl import JsonlWriter
 from datatrove.pipeline.tokens.counter import TokensCounter
 from datatrove.pipeline.inference.run_inference import (
@@ -47,9 +48,9 @@ from postprocessing.normalize import Normalize
 from postprocessing.remove_image_annots import RemoveImageAnnotationsByRatio
 from datatrove.utils.hashing import HashConfig
 # --- Project-specific imports ---
-from blocks.extractors.docling import DoclingExtractor
+from blocks.extractors.opendataloader import OpenDataLoaderExtractor, java_available
 from blocks.predictor.ocr_predictor import PDFScannedPredictor
-from blocks.readers.warc_reparse import WarcIndexReprocess
+from blocks.readers.warc_reparse import WarcIndexReprocess, _transient_cc_read_error
 from blocks.utils import MIME_TYPES, index_adapter, filter_non_pdf, filter_non_truncated
 from classification.label_utils import AddTextChunks
 
@@ -62,14 +63,80 @@ from pipeline_utils.postprocess_utils import (
     CoallesceFailedPages,
     rollout_postprocess,
 )
-from pipeline_utils.push_utils import push_adapter
 
 # =====================================================================================
 # Constants aggregated from original scripts
 # =====================================================================================
 
 CC_INDEX_INPUT_TEMPLATE = "s3://commoncrawl/cc-index/table/cc-main/warc/crawl={crawl_id}/subset=warc"
-CC_PATHS_TEMPLATE = "s3://commoncrawl/crawl-data/{crawl_id}/warc.paths.gz"
+CC_PATHS_TEMPLATE = "crawl-data/{crawl_id}/warc.paths.gz"
+# Local runs: HTTPS (no AWS). On AWS EC2 set FINEPDFS_CC_USE_S3=1 for S3 + parquet index.
+CC_HTTP_BASE = "https://data.commoncrawl.org"
+CC_S3_STORAGE_OPTIONS = {"anon": True, "client_kwargs": {"region_name": "us-east-1"}}
+
+
+def _use_cc_s3() -> bool:
+    return os.environ.get("FINEPDFS_CC_USE_S3", "0") == "1"
+
+
+def _cc_s3(path: str) -> tuple[str, dict]:
+    return (path, CC_S3_STORAGE_OPTIONS)
+
+
+def cc_data_root() -> str | tuple[str, dict]:
+    if _use_cc_s3():
+        return _cc_s3("s3://commoncrawl")
+    return CC_HTTP_BASE
+
+
+def cc_paths_file(crawl_id: str) -> str | tuple[str, dict]:
+    rel = CC_PATHS_TEMPLATE.format(crawl_id=crawl_id)
+    if _use_cc_s3():
+        return _cc_s3(f"s3://commoncrawl/{rel}")
+    return f"{CC_HTTP_BASE}/{rel}"
+
+
+CC_PATHS_CACHE_DIR = "./finepdfs/data/cc_cache"
+
+
+def ensure_cc_warc_paths_cached(crawl_id: str, max_retries: int = 6, base_delay: float = 5.0) -> str:
+    """Download warc.paths.gz with retries; reuse local cache when Common Crawl returns 503."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    cache_dir = os.path.join(CC_PATHS_CACHE_DIR, crawl_id)
+    os.makedirs(cache_dir, exist_ok=True)
+    local_path = os.path.join(cache_dir, "warc.paths.gz")
+    if os.path.isfile(local_path) and os.path.getsize(local_path) > 100:
+        with open(local_path, "rb") as f:
+            if f.read(2) == b"\x1f\x8b":
+                return local_path
+
+    url = f"{CC_HTTP_BASE}/{CC_PATHS_TEMPLATE.format(crawl_id=crawl_id)}"
+    last_err: BaseException | None = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "finepdfs-pipeline/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+            if len(data) < 100 or data[:2] != b"\x1f\x8b":
+                raise OSError(f"Invalid warc.paths.gz from {url} ({len(data)} bytes)")
+            with open(local_path, "wb") as f:
+                f.write(data)
+            return local_path
+        except Exception as exc:
+            last_err = exc
+            if attempt + 1 >= max_retries:
+                break
+            delay = base_delay * (2**attempt)
+            print(
+                f"Common Crawl warc.paths.gz unavailable ({exc}); retry in {delay:.0f}s...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    assert last_err is not None
+    raise last_err
 SPLIT_TRUNCATION_DIR = "./finepdfs/data/split_truncation/{prefix}"
 PDF_SAVE_DIR = "./finepdfs/data/pdf"
 
@@ -77,6 +144,8 @@ BYTE_CONTENT_DEDUPLICATION_DIR_OUTPUT = "./finepdfs/data/byte_content_deduplicat
 OCR_CLASSIFICATION_DIR_OUTPUT = "./finepdfs/data/ocr_classification/{prefix}"
 DEDUP_OUTPUT_DIR = "./finepdfs/data/content_dedup/{prefix}"
 PDF_SCANNED_MODEL_PATH = "./models/xgb_ocr_classifier/xgb_classifier.ubj"
+HERON_MODEL_XML = "./models/heron/heron_int8_quant.xml"
+HERON_MODEL_BIN = "./models/heron/heron_int8_quant.bin"
 
 INPUT_DIR_EXTRACT = "./finepdfs/data/content_dedup/{prefix}"
 OUTPUT_OCR_DIR = "./finepdfs/data/ocr_docs_extracted/{prefix}"
@@ -99,10 +168,155 @@ OUTPUT_DIR_MODEL = "./finepdfs/data/model_labeling/per_language"
 PER_LANGUAGE_DIR_MINHASH = "./finepdfs/data/model_labeling/per_language"
 OUTPUT_DIR_MINHASH = "./finepdfs/data/minhash/per_language"
 
-PUSH_INPUT_DIR = "./finepdfs/data/minhash/per_language/"
+# Step 1: WARC records (responses) to scan per crawl — not PDF count.
+LIMIT = 5000
+# Must match tasks= on ExactFindDedups executor (step 2.2); use 1 on a weak PC.
+EXACT_CONTENT_DEDUP_FINDER_WORKERS = 1
+# Must match xgb_classifier.ubj training (8 pages). Lower values cause feature_names mismatch.
+OCR_PREDICTOR_NUM_PAGES_TO_SAMPLE = 8
 
-# Adjust as needed, low for demo purposes (for real run we didn't limit)
-LIMIT = 10000
+
+def _split_truncation_has_inputs(prefix: str) -> bool:
+    folder = SPLIT_TRUNCATION_DIR.format(prefix=prefix)
+    return bool(glob.glob(os.path.join(folder, "**", "*.jsonl.gz"), recursive=True))
+
+
+def _step1_produced_any() -> bool:
+    return any(_split_truncation_has_inputs(p) for p in ("truncated", "non_truncated", "failed_pdf_fetch"))
+
+
+def _is_git_lfs_pointer(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(64).startswith(b"version https://git-lfs")
+    except OSError:
+        return False
+
+
+def _opendataloader_ready() -> bool:
+    return java_available()
+
+
+def _skip_gpu_steps(gpus: int) -> bool:
+    if os.environ.get("FINEPDFS_SKIP_GPU_STEPS", "").lower() in ("1", "true", "yes"):
+        return True
+    if gpus <= 0:
+        return True
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("vllm") is None
+    except Exception:
+        return True
+
+
+def _has_extracted_outputs() -> bool:
+    globs = (
+        os.path.join(OUTPUT_NON_OCR_DIR.format(prefix="**"), "extracted", "*.jsonl.gz"),
+        os.path.join(OUTPUT_OCR_DIR.format(prefix="**"), "extracted", "*.jsonl.gz"),
+    )
+    return any(glob.glob(p, recursive=True) for p in globs)
+
+
+def _has_postprocessed_docling() -> bool:
+    return bool(glob.glob(os.path.join(SAVE_DOCLING_DIR, "*.jsonl.gz")))
+
+
+def _has_postprocessed_ocr() -> bool:
+    return bool(glob.glob(os.path.join(SAVE_OCR_DIR, "**", "*.jsonl.gz"), recursive=True))
+
+
+def _language_shards_ready(languages: Optional[list[str]] = None) -> bool:
+    if languages:
+        return any(
+            glob.glob(os.path.join(PER_LANGUAGE_DIR_EXACT, lang, "*.jsonl.gz"))
+            for lang in languages
+        )
+    return bool(
+        glob.glob(os.path.join(PER_LANGUAGE_DIR_EXACT, "**", "*.jsonl.gz"), recursive=True)
+    )
+
+
+def _patch_datatrove_jsonl_utf8() -> None:
+    """JsonlReader opens text files without encoding; on Windows that is cp1252, not UTF-8."""
+    if getattr(JsonlReader, "_finepdfs_utf8", False):
+        return
+    import base64
+
+    import orjson
+    from orjson import JSONDecodeError
+
+    from datatrove.utils.logging import logger
+
+    def read_file(self, filepath: str):
+        with self.data_folder.open(
+            filepath, "r", compression=self.compression, encoding="utf-8"
+        ) as f:
+            try:
+                for li, line in enumerate(f):
+                    with self.track_time():
+                        try:
+                            line = orjson.loads(line)
+                            for media in line.get("media", []):
+                                if media["media_bytes"] is not None:
+                                    media["media_bytes"] = base64.decodebytes(
+                                        media["media_bytes"].encode("ascii")
+                                    )
+                            document = self.get_document_from_dict(line, filepath, li)
+                            if not document:
+                                continue
+                        except (EOFError, JSONDecodeError) as e:
+                            logger.warning(f"Error when reading `{filepath}`: {e}")
+                            continue
+                    yield document
+            except UnicodeDecodeError as e:
+                logger.warning(
+                    f"File `{filepath}` may be corrupted: raised UnicodeDecodeError ({e})"
+                )
+
+    JsonlReader.read_file = read_file
+    JsonlReader._finepdfs_utf8 = True
+
+
+def _content_dedup_has_inputs(truncation: str, branch: str) -> bool:
+    folder = DEDUP_OUTPUT_DIR.format(prefix=f"{truncation}/{branch}")
+    return bool(glob.glob(os.path.join(folder, "**", "*.jsonl.gz"), recursive=True))
+
+
+def _any_content_dedup_non_ocr() -> bool:
+    return any(_content_dedup_has_inputs(t, "non_ocr") for t in ("truncated", "non_truncated"))
+
+
+def _tag_non_ocr_metadata(doc: Document) -> bool:
+    meta = doc.media[0].metadata or {}
+    meta["ocr_prob"] = 0.0
+    meta["garbled_text_ratio"] = 0.0
+    doc.media[0].metadata = meta
+    return True
+
+
+def _ocr_classifier_step(
+    path_to_model: str,
+    exclusion_writer: JsonlWriter,
+    num_pages_to_sample: int,
+    timeout: int,
+) -> PipelineStep:
+    if _is_git_lfs_pointer(path_to_model):
+        print(
+            "XGBoost OCR model not downloaded (Git LFS pointer only). "
+            "Run: git lfs pull --include=models/xgb_ocr_classifier/xgb_classifier.ubj\n"
+            "For now, treating all PDFs as non-OCR (digital).",
+            file=sys.stderr,
+        )
+        return LambdaFilter(_tag_non_ocr_metadata)
+    return PDFScannedPredictor(
+        path_to_model=path_to_model,
+        exclusion_writer=exclusion_writer,
+        exclude_failed=True,
+        num_pages_to_sample=num_pages_to_sample,
+        timeout=timeout,
+    )
+
 
 # =====================================================================================
 # Step 1: filter_pdfs_and_refetch
@@ -110,19 +324,21 @@ LIMIT = 10000
 
 def run_filter_pdfs_and_refetch(crawl_ids: list[str]):
     for crawl_id in crawl_ids:
-        if crawl_id < "CC-MAIN-2019-47":
-            index_reader = WarcIndexReprocess(
-                data_folder=f"s3://commoncrawl",
-                limit=LIMIT,
-                paths_file=CC_PATHS_TEMPLATE.format(crawl_id=crawl_id),
-            )
-        else:
+        # Parquet cc-index on S3 only (AWS). Outside AWS, Common Crawl serves data over HTTPS.
+        if _use_cc_s3() and crawl_id >= "CC-MAIN-2019-47":
             index_reader = ParquetReader(
-                data_folder=CC_INDEX_INPUT_TEMPLATE.format(crawl_id=crawl_id),
+                data_folder=_cc_s3(CC_INDEX_INPUT_TEMPLATE.format(crawl_id=crawl_id)),
                 glob_pattern="*.parquet",
                 doc_progress=True,
                 adapter=index_adapter,
                 limit=LIMIT,
+            )
+        else:
+            paths_file = ensure_cc_warc_paths_cached(crawl_id)
+            index_reader = WarcIndexReprocess(
+                data_folder=cc_data_root(),
+                limit=LIMIT,
+                paths_file=paths_file,
             )
 
         pipeline = [
@@ -136,10 +352,10 @@ def run_filter_pdfs_and_refetch(crawl_ids: list[str]):
             ),
             # For production purposes, it's not wise to to run this in one pipeline for good resource allocation.
             # We recommend separting the httpfetch reader to a separate pipeline to maximize resource utilization.
-            HTTPFetchReader(workers=15, max_retries=3, timeout=(60, 60), download_timeout=60 * 10),
+            HTTPFetchReader(workers=1, max_retries=5, retry_delay=3, timeout=(20, 20), download_timeout=90),
             MimeTypeFilter(mime_types=MIME_TYPES["pdf"]),
             ZstdWriter(
-                max_file_size=100 * 1024 * 1024 * 1024,
+                max_file_size=128 * 1024 * 1024,
                 output_folder=PDF_SAVE_DIR,
                 output_filename=f"{crawl_id.replace('-', '_')}_${{rank}}.zstd",
             ),
@@ -154,7 +370,13 @@ def run_filter_pdfs_and_refetch(crawl_ids: list[str]):
             ),
         ]
 
-        LocalPipelineExecutor(pipeline).run()
+        try:
+            LocalPipelineExecutor(pipeline).run()
+        except Exception as exc:
+            if _transient_cc_read_error(exc) or "warc.paths" in str(exc).lower():
+                print(f"Skipping crawl {crawl_id} after CC network error: {exc}", file=sys.stderr)
+                continue
+            raise
 
 
 # =====================================================================================
@@ -178,16 +400,23 @@ def _filter_ocr(x: Document):
 
 def run_content_dedup_ocr_organize():
     for truncation in ["truncated", "non_truncated"]:
+        if not _split_truncation_has_inputs(truncation):
+            print(
+                f"Skipping step 2 ({truncation}): no files in "
+                f"{SPLIT_TRUNCATION_DIR.format(prefix=truncation)}",
+                file=sys.stderr,
+            )
+            continue
         if truncation == "non_truncated":
             reader = WarcReaderFast(
-                data_folder="s3://commoncrawl",
+                data_folder=cc_data_root(),
                 preserve_order=True,
-                workers=5,
+                workers=1,
             )
         else:
             reader = ZstdReader(
                 data_folder=PDF_SAVE_DIR,
-                workers=2,
+                workers=1,
                 preserve_order=True,
             )
 
@@ -202,7 +431,7 @@ def run_content_dedup_ocr_organize():
             ExactDedupSignature(
                 config=CONTENT_DEDUP_CONFIG,
                 output_folder=DEDUP_OUTPUT_DIR.format(prefix=f"{truncation}/sigs"),
-                finder_workers=100,
+                finder_workers=EXACT_CONTENT_DEDUP_FINDER_WORKERS,
             ),
         ]
 
@@ -230,19 +459,24 @@ def run_content_dedup_ocr_organize():
                 ),
             ),
             reader,
-            PDFScannedPredictor(
-                path_to_model=PDF_SCANNED_MODEL_PATH,
+            _ocr_classifier_step(
+                PDF_SCANNED_MODEL_PATH,
                 exclusion_writer=JsonlWriter(
                     output_folder=DEDUP_OUTPUT_DIR.format(prefix=f"{truncation}/failed_ocr")
                 ),
-                exclude_failed=True,
+                num_pages_to_sample=OCR_PREDICTOR_NUM_PAGES_TO_SAMPLE,
+                timeout=20,
             ),
             LambdaFilter(_filter_ocr, exclusion_writer=JsonlWriter(output_folder=DEDUP_OUTPUT_DIR.format(prefix=f"{truncation}/ocr"))),
             JsonlWriter(output_folder=DEDUP_OUTPUT_DIR.format(prefix=f"{truncation}/non_ocr")),
         ]
 
         LocalPipelineExecutor(pipeline1).run()
-        LocalPipelineExecutor(pipeline2, tasks=100, workers=1).run()
+        LocalPipelineExecutor(
+            pipeline2,
+            tasks=EXACT_CONTENT_DEDUP_FINDER_WORKERS,
+            workers=EXACT_CONTENT_DEDUP_FINDER_WORKERS,
+        ).run()
         LocalPipelineExecutor(pipeline3).run()
 
 
@@ -250,55 +484,82 @@ def run_content_dedup_ocr_organize():
 # Step 3: extract
 # =====================================================================================
 
-def run_extract(gpus: int=1):
-    # Non-OCR extraction (Docling)
-    # Use can play around with docling imports and remove torch deps as our quant needs just open vino
-    # This allowed us to run the pipeline on 1 cpu with 2GB or RAM. We highly recommend AVX512 support for optimal performance.
-    for truncation in ["truncated", "non_truncated"]:
-        if truncation == "non_truncated":
-            reader = WarcReaderFast(
-                data_folder="s3://commoncrawl",
-                preserve_order=True,
-                workers=5,
-            )
-        else:
-            reader = ZstdReader(
-                data_folder=PDF_SAVE_DIR,
-                workers=2,
-                preserve_order=True,
-            )
-        pipeline_docling = [
-            JsonlReader(
-                data_folder=INPUT_DIR_EXTRACT.format(prefix=f"{truncation}/non_ocr"),
-                glob_pattern="**/*.jsonl.gz",
-                doc_progress=True,
-            ),
-            reader,
-            DoclingExtractor(
-                timeout=10 * 60,
-                exclusion_writer=JsonlWriter(
-                    output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/failed")
+def run_extract(gpus: int = 1):
+    skip_gpu = _skip_gpu_steps(gpus)
+    if skip_gpu:
+        print(
+            "Skipping RolmOCR (vLLM): no GPU / vllm not installed (expected on Windows CPU install).",
+            file=sys.stderr,
+        )
+    if not _opendataloader_ready():
+        print(
+            "Skipping OpenDataLoader PDF: Java 11+ not found on PATH.\n"
+            "Install JDK from https://adoptium.net/ and ensure `java -version` works.",
+            file=sys.stderr,
+        )
+    # Non-OCR extraction (OpenDataLoader PDF; needs Java, no heron/docling models)
+    if _opendataloader_ready():
+        for truncation in ["truncated", "non_truncated"]:
+            if not _content_dedup_has_inputs(truncation, "non_ocr"):
+                print(
+                    f"Skipping step 3 OpenDataLoader ({truncation}): no files in "
+                    f"{DEDUP_OUTPUT_DIR.format(prefix=f'{truncation}/non_ocr')}",
+                    file=sys.stderr,
+                )
+                continue
+            if truncation == "non_truncated":
+                reader = WarcReaderFast(
+                    data_folder=cc_data_root(),
+                    preserve_order=True,
+                    workers=1,
+                )
+            else:
+                reader = ZstdReader(
+                    data_folder=PDF_SAVE_DIR,
+                    workers=1,
+                    preserve_order=True,
+                )
+            pipeline_extract = [
+                JsonlReader(
+                    data_folder=INPUT_DIR_EXTRACT.format(prefix=f"{truncation}/non_ocr"),
+                    glob_pattern="**/*.jsonl.gz",
+                    doc_progress=True,
                 ),
-            ),
-            JsonlWriter(output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/extracted")),
-        ]
-        LocalPipelineExecutor(pipeline_docling).run()
+                reader,
+                OpenDataLoaderExtractor(
+                    timeout=10 * 60,
+                    exclusion_writer=JsonlWriter(
+                        output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/failed")
+                    ),
+                ),
+                JsonlWriter(output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/extracted")),
+            ]
+            LocalPipelineExecutor(pipeline_extract).run()
 
     # OCR extraction via InferenceRunner
     # For production environment, this is too slow as you should asynchronously fetch PDFs from bucket inside the query preparation step.
     # We use synchronous fetching here for simplicity.
     # On h100 you should be able to see ~5 pages/s per worker
+    if skip_gpu:
+        return
     for truncation in ["truncated", "non_truncated"]:
+        if not _content_dedup_has_inputs(truncation, "ocr"):
+            print(
+                f"Skipping step 3 RolmOCR ({truncation}): no files in "
+                f"{DEDUP_OUTPUT_DIR.format(prefix=f'{truncation}/ocr')}",
+                file=sys.stderr,
+            )
+            continue
         if truncation == "non_truncated":
             reader = WarcReaderFast(
-                data_folder="s3://commoncrawl",
+                data_folder=cc_data_root(),
                 preserve_order=True,
-                workers=5,
+                workers=1,
             )
         else:
             reader = ZstdReader(
                 data_folder=PDF_SAVE_DIR,
-                workers=2,
+                workers=1,
                 preserve_order=True,
             )
 
@@ -307,7 +568,7 @@ def run_extract(gpus: int=1):
             config=InferenceConfig(
                 model_name_or_path="reducto/RolmOCR",
                 default_generation_params={"temperature": 0.0},
-                max_concurrent_generations=50 if truncation == "truncated" else 300,
+                max_concurrent_generations=1,
                 server_type="vllm",
                 metric_interval=100,
                 dp=gpus,
@@ -331,74 +592,112 @@ def run_extract(gpus: int=1):
 # Step 4: postprocess
 # =====================================================================================
 
-def run_postprocess():
+def run_postprocess(gpus: int = 1):
     language_tagger = LanguageTagger(language_threshold=0.01, label_only=True, backend="glotlid")
-    # OCR branch postprocessing
-    for truncation in ["truncated", "non_truncated"]:
-        if truncation == "non_truncated":
-            reader = WarcReaderFast(
-                data_folder="s3://commoncrawl",
-                preserve_order=True,
-                workers=5,
+    skip_gpu = _skip_gpu_steps(gpus)
+    if not skip_gpu:
+        # OCR branch postprocessing
+        for truncation in ["truncated", "non_truncated"]:
+            ocr_glob = os.path.join(
+                OCR_INPUT_DIR, truncation, "extracted", "*.jsonl.gz"
             )
-        else:
-            reader = ZstdReader(
-                data_folder=PDF_SAVE_DIR,
-                workers=2,
-                preserve_order=True,
-            )
+            if not glob.glob(ocr_glob):
+                continue
+            if truncation == "non_truncated":
+                reader = WarcReaderFast(
+                    data_folder=cc_data_root(),
+                    preserve_order=True,
+                    workers=1,
+                )
+            else:
+                reader = ZstdReader(
+                    data_folder=PDF_SAVE_DIR,
+                    workers=1,
+                    preserve_order=True,
+                )
 
-        pipeline_ocr = [
-            JsonlReader(
-                data_folder=OCR_INPUT_DIR,
-                glob_pattern=f"{truncation}/extracted/*.jsonl.gz",
-            ),
-            reader,
-            AddMetadata(is_docling=False, is_truncated=truncation == "truncated"),
+            pipeline_ocr = [
+                JsonlReader(
+                    data_folder=OCR_INPUT_DIR,
+                    glob_pattern=f"{truncation}/extracted/*.jsonl.gz",
+                ),
+                reader,
+                AddMetadata(is_docling=False, is_truncated=truncation == "truncated"),
+                DropFailedDocuments(EMPTY_PAGES_DOCLING_DIR),
+                CoallesceFailedPages(FAILED_PAGES_OCR_DIR),
+                TagBoilerplateFormatter(is_ocr=True, drop=True),
+                Normalize(is_from_docling=False),
+                language_tagger,
+                TokensCounter(batch_size=16, tokenizer_name_or_path="hynky/Llama-3.2-1B-no-bos"),
+                # Removes hallucinations caused by blank pages
+                # This is very expensive the way we are doing so, better option
+                # would be to finetuned ViT model to classify blank pages, however
+                # this we didn't have time for it.
+                InferenceRunner(
+                    rollout_fn=rollout_postprocess,
+                    config=InferenceConfig(
+                        model_name_or_path="Qwen/Qwen2.5-VL-7B-Instruct",
+                        default_generation_params={"temperature": 0.0},
+                        max_concurrent_generations=1,
+                        server_type="vllm",
+                        metric_interval=100,
+                    ),
+                    output_writer=JsonlWriter(
+                        output_folder=SAVE_OCR_DIR.format(prefix=f"extracted")
+                    ),
+                ),
+            ]
+            LocalPipelineExecutor(pipeline_ocr).run()
+    else:
+        print(
+            "Skipping OCR postprocess (Qwen vLLM): no GPU / vllm not installed.",
+            file=sys.stderr,
+        )
+
+
+
+    pipeline_docling: list[PipelineStep] = []
+    if glob.glob(os.path.join(DOCLING_INPUT_DIR, "non_truncated", "extracted", "*.jsonl.gz")):
+        pipeline_docling.extend(
+            [
+                JsonlReader(
+                    data_folder=DOCLING_INPUT_DIR,
+                    glob_pattern="non_truncated/extracted/*.jsonl.gz",
+                ),
+                AddMetadata(is_docling=False, pdf_extractor="opendataloader", is_truncated=False),
+            ]
+        )
+    if glob.glob(os.path.join(DOCLING_INPUT_DIR, "truncated", "extracted", "*.jsonl.gz")):
+        pipeline_docling.extend(
+            [
+                JsonlReader(
+                    data_folder=DOCLING_INPUT_DIR,
+                    glob_pattern="truncated/extracted/*.jsonl.gz",
+                ),
+                AddMetadata(is_docling=False, pdf_extractor="opendataloader", is_truncated=True),
+            ]
+        )
+    if not pipeline_docling:
+        print(
+            "Skipping step 4 postprocess (OpenDataLoader): no extracted jsonl under "
+            f"{DOCLING_INPUT_DIR}",
+            file=sys.stderr,
+        )
+        return
+    pipeline_docling.extend(
+        [
+            RemoveDoclingMetadata(),
             DropFailedDocuments(EMPTY_PAGES_DOCLING_DIR),
-            CoallesceFailedPages(FAILED_PAGES_OCR_DIR),
-            TagBoilerplateFormatter(is_ocr=True, drop=True),
+            PostprocessPageNumbers(),
+            CleanTables(),
+            RemoveImageAnnotationsByRatio(ratio_threshold=0.8),
+            TagBoilerplateFormatter(is_ocr=False, drop=True),
             Normalize(is_from_docling=False),
             language_tagger,
-            TokensCounter(batch_size=1000, tokenizer_name_or_path="hynky/Llama-3.2-1B-no-bos"),
-            # Removes hallucinations caused by blank pages
-            # This is very expensive the way we are doing so, better option
-            # would be to finetuned ViT model to classify blank pages, however
-            # this we didn't have time for it.
-            InferenceRunner(
-                rollout_fn=rollout_postprocess,
-                config=InferenceConfig(
-                    model_name_or_path="Qwen/Qwen2.5-VL-7B-Instruct",
-                    default_generation_params={"temperature": 0.0},
-                    max_concurrent_generations=50,
-                    server_type="vllm",
-                    metric_interval=100,
-                ),
-                output_writer=JsonlWriter(
-                    output_folder=SAVE_OCR_DIR.format(prefix=f"extracted")
-                ),
-            ),
+            TokensCounter(batch_size=16, tokenizer_name_or_path="hynky/Llama-3.2-1B-no-bos"),
+            JsonlWriter(output_folder=SAVE_DOCLING_DIR),
         ]
-        LocalPipelineExecutor(pipeline_ocr).run()
-
-
-
-    pipeline_docling = [
-        JsonlReader(data_folder=DOCLING_INPUT_DIR, glob_pattern="non_truncated/extracted/*.jsonl.gz"),
-        AddMetadata(is_docling=True, is_truncated=False),
-        JsonlReader(data_folder=DOCLING_INPUT_DIR, glob_pattern="truncated/extracted/*.jsonl.gz"),
-        AddMetadata(is_docling=True, is_truncated=True),
-        RemoveDoclingMetadata(),
-        DropFailedDocuments(EMPTY_PAGES_DOCLING_DIR),
-        PostprocessPageNumbers(),
-        CleanTables(),
-        RemoveImageAnnotationsByRatio(ratio_threshold=0.8),
-        TagBoilerplateFormatter(is_ocr=False, drop=True),
-        Normalize(is_from_docling=True),
-        language_tagger,
-        TokensCounter(batch_size=1000, tokenizer_name_or_path="hynky/Llama-3.2-1B-no-bos"),
-        JsonlWriter(output_folder=SAVE_DOCLING_DIR),
-    ]
+    )
     LocalPipelineExecutor(pipeline_docling).run()
 
 # =====================================================================================
@@ -419,17 +718,31 @@ def run_language_filter(languages: Optional[list[str]] = None):
     language_thresholds_dict["zxx_Zzzz"] = -1
     language_thresholds_dict["zxx_Arab"] = -1
 
-    pipeline: list[PipelineStep] = [
-        JsonlReader(
-            data_folder=SAVE_DOCLING_DIR,
-            glob_pattern="*.jsonl.gz",
-        ),
-        JsonlReader(
-            data_folder=SAVE_OCR_DIR,
-            glob_pattern="*.jsonl.gz",
-        ),
-        SelectBestLanguage(language_thresholds_dict=language_thresholds_dict),
-    ]
+    pipeline: list[PipelineStep] = []
+    if _has_postprocessed_docling():
+        pipeline.append(
+            JsonlReader(
+                data_folder=SAVE_DOCLING_DIR,
+                glob_pattern="*.jsonl.gz",
+            )
+        )
+    if _has_postprocessed_ocr():
+        pipeline.append(
+            JsonlReader(
+                data_folder=SAVE_OCR_DIR,
+                glob_pattern="**/*.jsonl.gz",
+            )
+        )
+    if not pipeline:
+        print(
+            "Skipping language filter: no jsonl in "
+            f"{SAVE_DOCLING_DIR} or {SAVE_OCR_DIR}",
+            file=sys.stderr,
+        )
+        return
+    pipeline.append(
+        SelectBestLanguage(language_thresholds_dict=language_thresholds_dict)
+    )
 
     # Optionally restrict to selected languages
     if languages:
@@ -467,7 +780,7 @@ def create_content_getter_exact():
 EXACT_CONFIG = ExactDedupConfig(content_getter=create_content_getter_exact())
 
 
-def run_exact_dedup(languages: Optional[list[str]] = None, tasks: int = 100):
+def run_exact_dedup(languages: Optional[list[str]] = None, tasks: int = 2):
     if not languages:
         languages = [
             lang
@@ -591,9 +904,9 @@ def run_model_classification(languages: Optional[list[str]] = None, gpus: int = 
 
         model_kwargs = {
             "server_script": f"{CURRENT_DIR}/blocks/classification/tf_batching.py",
-            "batch-size": 256,
+            "batch-size": 8,
             "batch-timeout": 10.0,
-            "max-context": 2048,
+            "max-context": 1024,
             "model-name-or-path": ";".join(present_models),
             "host": "0.0.0.0",
         }
@@ -601,8 +914,8 @@ def run_model_classification(languages: Optional[list[str]] = None, gpus: int = 
         config = InferenceConfig(
             server_type="custom",
             model_name_or_path=";".join(present_models),
-            max_concurrent_generations=1024,
-            max_concurrent_documents=2048,
+            max_concurrent_generations=2,
+            max_concurrent_documents=2,
             model_kwargs=model_kwargs,
             dp=gpus,
             use_chat=False,
@@ -692,7 +1005,7 @@ def run_minhash(languages: Optional[list[str]] = None):
                 input_folder=f"{output_folder}/signatures",
                 output_folder=f"{output_folder}/buckets",
                 config=MINHASH_CONFIG,
-                lines_to_buffer=20000,
+                lines_to_buffer=500,
             ),
         ]
         pipeline3 = [
@@ -721,62 +1034,73 @@ def run_minhash(languages: Optional[list[str]] = None):
         LocalPipelineExecutor(pipeline4, tasks=tasks).run()
 
 
-def run_push_to_hub(languages: Optional[list[str]] = None):
-    if not languages:
-        languages = [
-            lang
-            for lang in get_datafolder(PUSH_INPUT_DIR).list_files(
-                include_directories=True, recursive=False
-            )
-            if lang
-        ]
-
-    for lang in languages:
-        pipeline = [
-            JsonlReader(
-                data_folder=f"{PUSH_INPUT_DIR}/{lang}/output",
-                glob_pattern=f"*.jsonl.gz",
-            ),
-            HuggingFaceDatasetWriter(
-                dataset="HuggingFaceFW/finepdfs_subset",
-                local_working_dir=f"./output_{lang}/${{rank}}",
-                output_filename=f"data/{lang}/train/${{rank}}.parquet",
-                adapter=push_adapter,
-            ),
-            LambdaFilter(lambda x: max(x.metadata.get("fw_edu_scores", [0])) >= 0.5),
-            HuggingFaceDatasetWriter(
-                dataset="HuggingFaceFW/finepdfs_fw_edu_subset",
-                local_working_dir=f"./output_edu_{lang}/${{rank}}",
-                output_filename=f"data/{lang}/train/${{rank}}.parquet",
-                adapter=push_adapter,
-            ),
-        ]
-        LocalPipelineExecutor(pipeline=pipeline).run()
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run FinePDFs pipeline sequentially")
     parser.add_argument("--crawl-ids", type=str, required=True, help="Comma-separated CommonCrawl crawl IDs for step 1")
     parser.add_argument("--languages", type=str, default=None, help="Comma-separated list of languages for steps 5-8")
-    parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs for model classification (step 6)")
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=0,
+        help="GPU count for vLLM steps (0 on Windows CPU). Set 1+ only with vllm on Linux+NVIDIA",
+    )
     return parser.parse_args()
 
 
 def main():
+    # Windows console: UTF-8 logs; avoid bogus AWS credential lookup for public S3
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+    _patch_datatrove_jsonl_utf8()
+
     args = parse_args()
     languages = [s.strip() for s in args.languages.split(",")] if args.languages else None
     crawl_ids = [s.strip() for s in args.crawl_ids.split(",")] if args.crawl_ids else []
 
     # Sequentially run all steps
     run_filter_pdfs_and_refetch(crawl_ids)
+    if not _step1_produced_any():
+        print(
+            f"Step 1 finished but found no PDFs in the first {LIMIT} WARC records. "
+            "Raise LIMIT in run_finepdfs_pipeline.py or try another --crawl-ids.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     run_content_dedup_ocr_organize()
+    if not _any_content_dedup_non_ocr():
+        print(
+            "Step 2 produced no documents in content_dedup/*/non_ocr. "
+            "If the OCR classifier failed, run: git lfs pull --include=models/xgb_ocr_classifier/xgb_classifier.ubj",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     run_extract(args.gpus)
-    run_postprocess()
+    if not _has_extracted_outputs():
+        print(
+            "Step 3 produced no extracted documents.\n"
+            "OpenDataLoader: install Java 11+ (https://adoptium.net/)\n"
+            "RolmOCR: Linux + NVIDIA GPU + pip install -e '.[gpu]'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    run_postprocess(args.gpus)
+    if not _has_postprocessed_docling() and not _has_postprocessed_ocr():
+        print("Step 4 produced no postprocessed jsonl.", file=sys.stderr)
+        sys.exit(1)
     run_language_filter(languages=languages)
+    if not _language_shards_ready(languages):
+        print(
+            "Language filter produced no matching documents"
+            + (f" for {languages}." if languages else ".")
+            + " PDF text may be another language (see step 4). "
+            "Retry without --languages or pick the language from glotlid output.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     run_exact_dedup(languages=languages)
     run_model_classification(languages=languages, gpus=args.gpus)
     run_minhash(languages=languages)
-    run_push_to_hub(languages=languages)
 
 
 if __name__ == "__main__":

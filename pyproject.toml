@@ -14,17 +14,26 @@ dependencies = [
     "docling",
     "docling-core",
     "docling-ibm-models",
-    "flash-attn==2.7.4.post1",
     "ipykernel>=6.30.1",
     "libmagic>=1.0",
+    "python-magic-bin>=0.4.14; sys_platform == 'win32'",
     "openvino>=2025.3.0",
     "pymupdf==1.26.1",
     "scikit-learn>=1.7.2",
     "torch==2.6.0",
-    "vllm>=0.8.5.post1",
     "xgboost>=3.0.5",
+    "opendataloader-pdf>=2.4.4",
 ]
 
+[project.optional-dependencies]
+# Linux + NVIDIA GPU only; vllm does not support native Windows
+gpu = [
+    "flash-attn==2.7.4.post1",
+    "vllm>=0.8.5.post1",
+]
+
+[tool.uv]
+no-build-isolation-package = ["fasttext-numpy2-wheel"]
 
 [tool.uv.sources]
 docling-ibm-models = { workspace = true }

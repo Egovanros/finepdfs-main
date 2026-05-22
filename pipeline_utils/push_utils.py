@@ -30,7 +30,9 @@ def push_adapter(self, doc: Document):
     best_language_per_page = doc.metadata.get("best_page_languages")
 
     is_truncated = doc.metadata.get("is_truncated")
-    extractor = "docling" if doc.metadata.get("is_docling") else "rolmOCR"
+    extractor = doc.metadata.get("pdf_extractor") or (
+        "docling" if doc.metadata.get("is_docling") else "rolmOCR"
+    )
     page_ends = doc.media[0].metadata.get("page_offsets")
 
     return {

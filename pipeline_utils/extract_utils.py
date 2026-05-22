@@ -249,7 +249,7 @@ async def rollout_extract(document: Document, generate: Any, **kwargs) -> Any:
     
     # To maintain performance, let's use a process pool.
     if not hasattr(rollout_extract, "process_pool"):
-        rollout_extract.process_pool = ProcessPoolExecutor(max_workers=4)
+        rollout_extract.process_pool = ProcessPoolExecutor(max_workers=1)
         atexit.register(rollout_extract.process_pool.shutdown)
 
     requests, n_pages = await asyncio.get_event_loop().run_in_executor(

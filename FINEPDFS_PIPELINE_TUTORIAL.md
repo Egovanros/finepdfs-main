@@ -17,9 +17,10 @@
 6. `run_exact_dedup(languages)`
 7. `run_model_classification(languages, gpus)`
 8. `run_minhash(languages)`
-9. `run_push_to_hub(languages)`
 
-При этом логика соответствует твоим 10 этапам: OCR-роутинг и извлечение/постпроцессинг разбиты на подветки (OCR vs non-OCR), а language split и две дедупликации идут отдельно.
+Выгрузка на Hugging Face Hub (`run_push_to_hub`) в текущей версии скрипта **отключена** — все результаты остаются на локальном диске.
+
+При этом OCR-роутинг и извлечение/постпроцессинг разбиты на подветки (OCR vs non-OCR), а language split и две дедупликации идут отдельно.
 
 ---
 
@@ -519,8 +520,21 @@ language_tagger = LanguageTagger(language_threshold=0.01, label_only=True, backe
 
 7. **`TokensCounter(...)`** — считает **сколько токенов** в тексте выбранным токенизатором (`hynky/Llama-3.2-1B-no-bos`). Это удобно для статистики длины и дальнейших фильтров.
 
-8. **`InferenceRunner` + `Qwen/Qwen2.5-VL-7B-Instruct` + `rollout_postprocess`** — самый тяжёлый кусок: **мультимодальная модель** смотрит на **страницы PDF** (через подготовку запросов в `rollout_postprocess`, которая снова использует `media_bytes`) и правит текст, чтобы **убрать галлюцинации с пустых страниц**.  
-   Параметры в коде: `temperature=0.0`, `max_concurrent_generations=50`, `server_type="vllm"`.
+8. **`InferenceRunner` + `Qwen/Qwen2.5-VL-7B-Instruct` + `rollout_postprocess`** — самый тяжёлый кусок OCR‑постобработки. Здесь важно не перепутать роль модели: **Qwen не переписывает весь документ «с нуля»**, а выступает как **детектор типа страницы по картинке** для заранее отобранных подозрительных страниц.
+
+   **Как это устроено в коде (`pipeline_utils/postprocess_utils.py`).**
+
+   - **Зачем снова нужен PDF (`media_bytes`).** Функция `prepare_requests_postprocess` открывает тот же PDF через PyMuPDF из `document.media[0].media_bytes`, **дорисовывает (рендерит) отдельные страницы в PNG** и кодирует их в base64. Без исходного файла модель не может «увидеть» страницу, только текст OCR — а цель как раз сравнить **картинку** с **подозрительным текстом**.
+
+   - **Какие страницы вообще отправляют в модель.** Строится список «потенциально галлюцинирующих» страниц: текст страницы — строка, **начинается с `The`**, и при этом в `best_page_languages` для этой страницы указано **`eng_Latn`** (жёсткая эвристика под типичный мусорный английский OCR). На **остальные** страницы Qwen **не вызывается** — это экономит GPU и время.
+
+   - **Что именно спрашивают у модели.** Для каждой отобранной страницы в запрос кладут **изображение страницы** и текстовый промпт `PAGE_TYPE_DETECTOR_PROMPT`: модель должна ответить **ровно одной строкой** — либо **`TEXT`** (на странице есть нормальный связный текст), либо **`NO_TEXT`** (пустая страница, обложка‑картинка, только декор и т.п., без «тела» текста).
+
+   - **Что делает `rollout_postprocess`.** Подготовка запросов тяжёлая (PyMuPDF + рендер), поэтому она гоняется в **`ProcessPoolExecutor`** (до 4 воркеров), чтобы не блокировать асинхронный цикл. Дальше для каждого подготовленного запроса вызывается `generate(...)` (параллельно через `asyncio.gather`), ответы складываются в `document.metadata["inference_results"]`, затем вызывается **`postprocess_postprocess`**: если для страницы ответ **не** равен строке `"TEXT"`, **текст этой страницы удаляется**; после этого **пересобирается** весь `document.text` и **пересчитываются** `page_offsets` / `page_indices` только по оставшимся страницам.
+
+   **Параметры в `run_finepdfs_pipeline.py`:** `model_name_or_path="Qwen/Qwen2.5-VL-7B-Instruct"`, `temperature=0.0`, `max_concurrent_generations=50`, `server_type="vllm"` — то есть тот же класс сервера, что и для RolmOCR, но другая модель и другая задача (классификация по изображению страницы).
+
+   **Почему это «дорого».** Даже при отборе части страниц остаётся рендер PNG, большие vision‑запросы и нагрузка на GPU;
 
 **Куда пишется результат OCR‑ветки**
 
@@ -641,106 +655,153 @@ pipeline = [
 
 ### Step 5: `exact_dedup` (`run_exact_dedup`)
 
-- **Название на русском**: **Шаг 5 — Точная дедупликация по тексту внутри языка + подготовка чанков**
-- **Что делает код (цель, подробно)**: после Step 4 у FinePDFs уже есть “человеко‑читаемый текст”, и теперь задача — убрать точные копии текста (например, одинаковые документы, которые пришли из разных URL или версий). Важная деталь: exact‑dedup выполняется **по нормализованному тексту без пробелов**, т.е. небольшие различия в whitespace не мешают определить дубликаты. После этого шаг готовит данные для моделей качества:
-  1) `ExactDedupSignature/FindDedups/Filter` строят и применяют список дубликатов **внутри одного language‑шарда**.
-  2) `AddTextChunks(...)` добавляет в `metadata["chunks"]` батч‑пригодные фрагменты текста для последующего inference, а затем документы пишутся в `OUTPUT_DIR_EXACT/output/<language>`.
-- **Какие функции/классы используются**:
-  - `ExactDedupSignature`, `ExactFindDedups`, `ExactDedupFilter`
-  - `AddTextChunks`
-  - `create_content_getter_exact()` (удаляет все пробелы)
-- **Какие входные данные принимает**: `PER_LANGUAGE_DIR_EXACT/<language>/*.jsonl.gz`
-- **Какие параметры настраиваются**:
-  - `tasks` (по умолчанию 100)
-  - `finder_workers` зависит от `tasks` (`worker_tasks = max(tasks//2, 1)`)
-  - токенайзер чанков: ModernBERT для `eng_Latn`, иначе mmBERT
-- **Какие выходные данные производит**:
-  - `OUTPUT_DIR_EXACT/output/<language>/*.jsonl.gz`
-  - `OUTPUT_DIR_EXACT/removed/<language>/*.jsonl.gz`
-- **Примеры ключевых строк кода с объяснением**:
+- **Название на русском (целиком шаг)**: **Шаг 5 — Точная дедупликация по тексту внутри каждого языка и нарезка текста на чанки для классификаторов**
+
+**Где этот шаг стоит в общей цепочке.**  
+После `run_language_filter` документы лежат в `./finepdfs/data/glotlid/per_language/<language_bucket>/...` — то есть **уже разнесены по языку**. Step 5 работает **отдельно для каждой папки‑языка** (`eng_Latn`, `rus_Cyrl`, …): внутри языка нет смысла сравнивать русский с французским, зато важно убрать **одинаковый текст** и подготовить вход для Step 6.
+
+**Что именно дедуплицируется (и чем это отличается от Step 2).**  
+На Step 2 дубликаты искали по **байтам PDF**. Здесь у документа уже есть **`doc.text`** — извлечённая строка. Функция `create_content_getter_exact()` для сравнения **убирает все пробельные символы** (`\s+` → пустая строка). Идея: два документа с **одним и тем же текстом**, но разными пробелами/переносами, считаются **одним и тем же** для exact‑dedup по тексту.
+
+**Почему снова три подпайплайна (как на Step 2 с байтами).**  
+Datatrove разбивает exact‑dedup на фазы, чтобы можно было параллелить и не держать всё в памяти:
+
+1. **`pipeline1` — сигнатуры.**  
+   `JsonlReader` читает все `*.jsonl.gz` из `./finepdfs/data/glotlid/per_language/<language>/`.  
+   `ExactDedupSignature` с конфигом `EXACT_CONFIG` считает сигнатуру от **нормализованного текста** (без пробелов) и пишет артефакты в `./finepdfs/data/exact_dedup/per_language/sigs/<language>/`.  
+   Параметр `finder_workers` здесь равен `worker_tasks = max(tasks // 2, 1)`, где `tasks` по умолчанию **100** (аргумент функции `run_exact_dedup`).
+
+2. **`pipeline2` — поиск дубликатов.**  
+   `ExactFindDedups` читает папку `sigs/<language>`, строит описание дубликатов и пишет в `./finepdfs/data/exact_dedup/per_language/dups/<language>/`.  
+   Запуск: `LocalPipelineExecutor(pipeline2, tasks=worker_tasks)` — число задач привязано к тому же `worker_tasks`.
+
+3. **`pipeline3` — фильтр + чанки + запись.**  
+   Снова `JsonlReader` из исходной языковой папки (полный список документов).  
+   `ExactDedupFilter` по данным из `dups/<language>` **отсекает дубликаты**; отфильтрованные документы пишет `exclude_writer` в `./finepdfs/data/exact_dedup/per_language/removed/<language>/`.  
+   Затем **`AddTextChunks`**: весь оставшийся текст режется на **чанки** под токенизатор (для **`eng_Latn`** — `answerdotai/ModernBERT-large`, для остальных языков — `mmbert-colab/mmBERT-base`). Чанки попадают в `document.metadata["chunks"]` — это нужно **только для Step 6**.  
+   Финальный `JsonlWriter` пишет результат в `./finepdfs/data/exact_dedup/per_language/output/<language>/*.jsonl.gz`.
+
+**Важно:** на этом шаге **нет** `WarcReaderFast` / `ZstdReader` — обрабатывается уже **только текст и metadata** в JSONL.
+
+**Список языков.**  
+Если в `run_exact_dedup(languages=...)` передан список (из CLI `--languages`), обрабатываются только они. Если `None`, языки **сканируются** как подкаталоги `PER_LANGUAGE_DIR_EXACT` через `get_datafolder(...).list_files(...)`.
+
+**Примеры ключевых фрагментов в коде:**
 
 ```python
-def content_getter(doc: Document) -> str:
-    return remove_spaces_regex.sub("", doc.text)
+EXACT_CONFIG = ExactDedupConfig(content_getter=create_content_getter_exact())
 ```
 
 ```python
-AddTextChunks(tokenizer_name="answerdotai/ModernBERT-large" if language == "eng_Latn" else "mmbert-colab/mmBERT-base")
+ExactDedupFilter(..., data_folder=f"{OUTPUT_DIR_EXACT}/dups/{language}", exclusion_writer=exclude_writer),
+AddTextChunks(tokenizer_name="answerdotai/ModernBERT-large" if language == "eng_Latn" else "mmbert-colab/mmBERT-base"),
 ```
-
-- **Возможные ошибки и как их обрабатывать**:
-  - **Слишком много языков**: можно ограничить `--languages`, чтобы не гонять весь набор.
 
 ---
 
 ### Step 6: `model_classification` (`run_model_classification`)
 
-- **Название на русском**: **Шаг 6 — Пер‑языковая классификация качества (EDU/DCLM)**
-- **Что делает код (цель, подробно)**: этот шаг превращает “просто текст” в “текст + оценки качества”, которые дальше используются как фильтры (особенно для английского) и как сигналы для downstream. Важные особенности реализации:
-  1) **Модели выбираются динамически**: для каждого языка формируются repo id `HuggingFaceFW/finepdfs_edu_classifier_{language}` и `..._dclm_classifier_{language}` и проверяются через `model_exists()`. Если моделей нет (или нет доступа), шаг делает passthrough (переписывает JSONL).
-  2) **Классификация идёт по чанкам**: `make_rollout_model()` создаёт rollout, который берёт `document.metadata["chunks"]`, отправляет каждый chunk как отдельный запрос и собирает серию оценок (список float/None) в `fw_edu_scores` и/или `dclm_scores`.
-  3) **Инференс выполняется через кастомный сервер** (`InferenceConfig(server_type="custom")`) и `server_script=blocks/classification/tf_batching.py`. Это позволяет эффективный batching (см. `batch-size=256`) и большую конкуррентность (`max_concurrent_generations=1024`).
-  4) После inference **чанки удаляются** (`document.metadata.pop("chunks", None)`), чтобы не раздувать финальный размер документа.
-- **Какие функции/классы используются**:
-  - `model_exists()` (через `huggingface_hub.HfApi`)
-  - `make_rollout_model(output_fields_in_order)`
-  - `InferenceRunner` + `InferenceConfig(server_type="custom")`
-- **Какие входные данные принимает**: `INPUT_DIR_MODEL/<language>/*.jsonl.gz` (это `OUTPUT_DIR_EXACT/output/<language>`)
-- **Какие параметры настраиваются**:
-  - `gpus` влияет на `dp`
-  - `model_kwargs` для кастомного сервера (`blocks/classification/tf_batching.py`, batch size, max context и т.д.)
-- **Какие выходные данные производит**: `OUTPUT_DIR_MODEL/<language>/*.jsonl.gz`
-- **Примеры ключевых строк кода с объяснением**:
+- **Название на русском (целиком шаг)**: **Шаг 6 — Оценка качества текста по чанкам (EDU и DCLM классификаторы на Hugging Face)**
 
-```python
-edu_model = f"HuggingFaceFW/finepdfs_edu_classifier_{language}"
-dclm_model = f"HuggingFaceFW/finepdfs_dclm_classifier_{language}"
-```
+**Откуда берутся входные данные.**  
+Константа `INPUT_DIR_MODEL` в скрипте указывает на `./finepdfs/data/exact_dedup/per_language/output` — то есть **ровно выход Step 5** по каждому языку. В каждом документе после Step 5 в `metadata["chunks"]` уже лежат строки для батчевой классификации.
 
-```python
-document.metadata[field] = series
-document.metadata.pop("chunks", None)
-```
+**Общая идея простыми словами.**  
+Нужно к каждому фрагменту текста (чанку) приписать **числа‑оценки качества** (насколько «образовательный» / полезный контент в смысле FinePDFs EDU, и отдельно сигнал DCLM, если для языка есть вторая модель). Эти числа потом используются в Step 7 (фильтр для английского) и при публикации на Hub.
 
-- **Возможные ошибки и как их обрабатывать**:
-  - **Сеть/HF API**: если `model_exists()` не может достучаться, классификация “выключится” (код сделает passthrough). Для production лучше логировать причину (в этом скрипте нет).
-  - **Непарсящийся ответ**: rollout ставит `None` значения по chunk’ам.
+**Как выбираются модели (динамически).**  
+Для каждого `language` собираются два возможных репозитория на Hub:
+
+- `HuggingFaceFW/finepdfs_edu_classifier_{language}` → если есть, в пайплайн добавляется и в ответах появится поле **`fw_edu_scores`** (список чисел по чанкам);
+- `HuggingFaceFW/finepdfs_dclm_classifier_{language}` → если есть, поле **`dclm_scores`**.
+
+Проверка «есть ли модель» — `model_exists()` через `HfApi().model_info(repo_id)`; при любой ошибке (сеть, 404, нет прав) возвращается `False` и эта модель **просто не подключается**.
+
+**Если ни одной модели нет.**  
+Строится короткий пайплайн: `JsonlReader` → `JsonlWriter` в `./finepdfs/data/model_labeling/per_language/<language>/` — документы **копируются без изменений** (без полей `fw_edu_scores` / `dclm_scores`).
+
+**Если хотя бы одна модель есть — кастомный inference.**  
+`InferenceConfig` с `server_type="custom"`: вместо vLLM поднимается **свой сервер** из скрипта `blocks/classification/tf_batching.py` с параметрами:
+
+- `batch-size=256`, `batch-timeout=10`, `max-context=2048`;
+- `model-name-or-path` — строка с **несколькими** репозиториями через **`;`**, если доступны и EDU, и DCLM;
+- `dp=gpus` — сколько GPU использовать (как в CLI `--gpus`);
+- `max_concurrent_generations=1024`, `max_concurrent_documents=2048` — агрессивный параллелизм на стороне клиента;
+- `use_chat=False`, логи сервера в `./server_logs`.
+
+**Что делает `make_rollout_model(output_fields_in_order)`.**  
+Для каждого документа:
+
+1. Берётся `document.metadata["chunks"]`.  
+2. На **каждый** чанк строится запрос `{"input": chunk}` и вызывается `generate(req)`; все запросы по документу идут **параллельно** через `asyncio.gather`.  
+3. Ответ каждого чанка ожидается как текст с **числами через запятую** (по одному числу на каждую подключённую модель **в том же порядке**, что и `output_fields_in_order`: сначала EDU, потом DCLM). Строка парсится в `float`; при ошибке — пустой список и в соответствующие позиции попадёт `None`.  
+4. Для каждого поля (`fw_edu_scores`, `dclm_scores`) собирается **список** значений по чанкам и кладётся в `document.metadata[field]`.  
+5. Ключ **`chunks` удаляется** (`pop`), чтобы в финальном JSONL не хранить длинные массивы чанков дважды.
+
+**Куда пишется результат.**  
+`./finepdfs/data/model_labeling/per_language/<language>/*.jsonl.gz` — это же путь `PER_LANGUAGE_DIR_MINHASH` для Step 7.
 
 ---
 
 ### Step 7: `minhash` (`run_minhash`)
 
-- **Название на русском**: **Шаг 7 — Приближённая дедупликация (near‑dedup) MinHash внутри языка**
-- **Что делает код (цель, подробно)**: этот шаг удаляет “почти одинаковые” документы (копии с мелкими изменениями, зеркала, репосты, версии с небольшими правками), которые exact‑dedup не поймает. MinHash реализован стандартным конвейером:
-  1) `MinhashDedupSignature`: превращает текст в набор хеш‑подписей по \(n\)-граммам (`n_grams=5`) и распределяет их по bucket’ам (`num_buckets=32`).
-  2) `MinhashDedupBuckets`: группирует сигнатуры по bucket’ам, подготавливая данные к кластеризации (буферизация `lines_to_buffer=20000` — компромисс между скоростью и памятью).
-  3) `MinhashDedupCluster`: строит кластеры near‑duplicates и сохраняет `cluster_id`/`cluster_size`.
-  4) `MinhashDedupFilter`: исключает документы, которые попали в “не‑выжившие” позиции внутри кластеров, и пишет оставшиеся в `output/`.
-  5) Для `eng_Latn` добавлен **качество‑гейт**: до построения сигнатур применяется `LambdaFilter`, который оставляет документы с `max(fw_edu_scores) >= 0.5`. Это уменьшает объём minhash‑работы и одновременно повышает качество финального англ. поднабора.
-- **Какие функции/классы используются**:
-  - `MinhashDedupSignature`, `MinhashDedupBuckets`, `MinhashDedupCluster`, `MinhashDedupFilter`
-  - `MINHASH_CONFIG` и `HashConfig(xxhash, 64)`
-  - `tokenizers_map` для выбора tokenizer language
-- **Какие входные данные принимает**: `PER_LANGUAGE_DIR_MINHASH/<language>/*.jsonl.gz` (это `OUTPUT_DIR_MODEL/<language>`)
-- **Какие параметры настраиваются**:
-  - `MINHASH_CONFIG` (buckets, ngrams, hashes)
-  - `lines_to_buffer=20000` в `MinhashDedupBuckets`
-  - вычисление `WORKERS` (кратность `num_buckets`)
-  - prefilter для `eng_Latn`: `fw_edu_scores >= 0.5`
-- **Какие выходные данные производит**:
-  - `OUTPUT_DIR_MINHASH/<language>/output/*.jsonl.gz`
-  - `.../removed/` + промежуточные `signatures/`, `buckets/`, `clusters/`
-- **Примеры ключевых строк кода с объяснением**:
+- **Название на русском (целиком шаг)**: **Шаг 7 — Приближённая дедупликация (MinHash): убрать «почти копии» документов внутри языка**
+
+**Чем это отличается от Step 5.**  
+Exact‑dedup по тексту (Step 5) ловит **точные** совпадения после выкидывания пробелов. MinHash ловит **очень похожие** тексты: те же статьи с мелкими правками, другой порядок абзацев, чуть другая вёрстка — такие пары exact не всегда увидит.
+
+**Откуда вход.**  
+`PER_LANGUAGE_DIR_MINHASH` в коде равен `./finepdfs/data/model_labeling/per_language` — то есть **выход Step 6** (с оценками EDU/DCLM в metadata, если модели были).
+
+**Особый фильтр только для английского.**  
+Если `language == "eng_Latn"`, перед MinHash к потоку добавляется  
+`LambdaFilter(lambda x: max(x.metadata.get("fw_edu_scores", [0])) >= 0.5)` — в near‑dedup попадают **только** документы с достаточно высокой EDU‑оценкой (хотя бы по одному чанку). Для остальных языков читается весь поток без этого фильтра.
+
+**Какой текст подаётся в MinHash.**  
+`create_content_getter_minhash()`: берётся `doc.text`, но если длина **больше 1 000 000** символов, текст **обрезается** не «в лоб», а по ближайшему пробелу после миллиона — чтобы не резать слово посередине.
+
+**Параметры `MINHASH_CONFIG` (что они значат интуитивно).**  
+
+- `n_grams=5` — сравнение идёт по **5‑граммам** (короткие подстроки из пяти элементов токенизации); похожие документы дают много общих 5‑грамм.  
+- `num_buckets=32`, `hashes_per_bucket=10` — сколько независимых «срезов» хеша строится (типичная схема MinHash LSH).  
+- `HashConfig(hash_fc="xxhash", precision=64)` — быстрая хеш‑функция и разрядность.
+
+**Поле `language` у `MinhashDedupSignature`.**  
+Туда передаётся не обязательно «язык документа», а **имя токенизатора для datatrove**: для части кодов есть `tokenizers_map` (например `lat_Latn` → `ita_Latn`), если для языка нет своего токенизатора или он медленный.
+
+**Четыре подпайплайна подряд (как конвейер).**  
+
+Для каждого языка считается `tasks =` число файлов `*.jsonl.gz` во входной папке языка.  
+`WORKERS` выводится из `tasks` и округляется к кратности `num_buckets` (32), чтобы хорошо балансировать работу по bucket’ам.
+
+1. **`pipeline1`** — `input_block` (reader + опциональный фильтр) → `MinhashDedupSignature` → папка `./finepdfs/data/minhash/per_language/<language>/signatures/`.  
+   `LocalPipelineExecutor(..., tasks=tasks)`.
+
+2. **`pipeline2`** — `MinhashDedupBuckets`: читает `signatures/`, пишет `buckets/` (`lines_to_buffer=20000` — сколько строк буферизовать при записи).  
+   `tasks=WORKERS`.
+
+3. **`pipeline3`** — `MinhashDedupCluster`: из `buckets/` строит `clusters/`, сохраняет **id кластера** и **размер кластера** (`save_cluster_id=True`, `save_cluster_size=True`).  
+   `tasks=1` (одна задача на весь кластеринг для языка).
+
+4. **`pipeline4`** — снова тот же `input_block`, затем `MinhashDedupFilter` по `clusters/`: документы, признанные near‑дубликатами, уходят в `./finepdfs/data/minhash/per_language/<language>/removed/`; оставшиеся — в `.../output/`.  
+   Снова `tasks=tasks`.
+
+**Куда смотреть дальше (push).**  
+`PUSH_INPUT_DIR` в скрипте — `./finepdfs/data/minhash/per_language/`; для публикации используется подпапка `<lang>/output/`.
+
+**Примеры ключевых фрагментов в коде:**
 
 ```python
-MinhashDedupSignature(..., config=MINHASH_CONFIG, language=tokenizer_name)
-MinhashDedupBuckets(..., lines_to_buffer=20000)
-MinhashDedupCluster(..., save_cluster_id=True, save_cluster_size=True)
-MinhashDedupFilter(..., load_cluster_ids=True, load_cluster_sizes=True)
+MINHASH_CONFIG = MinhashConfig(
+    hash_config=HashConfig(hash_fc="xxhash", precision=64),
+    num_buckets=32, hashes_per_bucket=10, n_grams=5,
+)
 ```
 
-- **Возможные ошибки и как их обрабатывать**:
-  - **Очень большие файлы/память**: уменьшать `lines_to_buffer`, снижать параллелизм.
+```python
+if language == "eng_Latn":
+    input_block = [JsonlReader(...), LambdaFilter(lambda x: max(x.metadata.get("fw_edu_scores", [0])) >= 0.5)]
+```
 
 ---
 
@@ -780,19 +841,233 @@ HuggingFaceDatasetWriter(dataset="HuggingFaceFW/finepdfs_fw_edu_subset", adapter
 
 ---
 
-## Практический “как запустить”
+## Параметры производительности (i3-6100, 8 GB RAM, без видеокарты)
 
-Минимальный запуск (пример):
+Константы в начале `run_finepdfs_pipeline.py` (блок **Performance / resource limits**) настроены под **Intel Core i3-6100** (2 ядра / 4 потока), **8 ГБ ОЗУ**, **без дискретной GPU**.
 
-```bash
+| Параметр | За что отвечает | Текущее значение |
+|----------|-----------------|------------------|
+| `LIMIT` | Сколько строк индекса Common Crawl на один crawl (макс. PDF на шаге 1) | `15` |
+| `HTTP_FETCH_WORKERS` | Параллельные HTTP-загрузки PDF (шаг 1) | `1` |
+| `HTTP_FETCH_MAX_RETRIES` | Повторы при ошибке загрузки | `2` |
+| `HTTP_FETCH_TIMEOUT` | Таймаут HTTP `(connect, read)`, сек | `(20, 20)` |
+| `HTTP_FETCH_DOWNLOAD_TIMEOUT` | Макс. время на один PDF, сек | `90` |
+| `ZSTD_MAX_FILE_SIZE_BYTES` | Макс. размер одного `.zstd` на диске | `128 MiB` |
+| `WARC_READER_WORKERS` | Потоки чтения WARC из S3 | `1` |
+| `ZSTD_READER_WORKERS` | Потоки чтения локальных `.zstd` | `1` |
+| `CONTENT_DEDUP_FINDER_WORKERS` | Потоки сигнатур exact dedup по байтам PDF | `2` |
+| `CONTENT_DEDUP_FIND_TASKS` | Задачи executor при поиске дубликатов | `1` |
+| `OCR_PREDICTOR_NUM_PAGES_TO_SAMPLE` | Страниц PDF для XGBoost «скан vs текст» (CPU). **Должно быть 8** — как при обучении модели; меньше → `feature_names mismatch` | `8` |
+| `OCR_PREDICTOR_TIMEOUT_SEC` | Таймаут `PDFScannedPredictor` | `20` |
+| `DOCLING_EXTRACT_TIMEOUT_SEC` | Таймаут Docling на документ | `120` (2 мин) |
+| `OCR_MAX_CONCURRENT_GENERATIONS_TRUNCATED` | Параллельные запросы RolmOCR (усечённые PDF) | `1` |
+| `OCR_MAX_CONCURRENT_GENERATIONS_NON_TRUNCATED` | Параллельные запросы RolmOCR (полные PDF из WARC) | `1` |
+| `QWEN_MAX_CONCURRENT_GENERATIONS` | Параллельные запросы Qwen2.5-VL | `1` |
+| `TOKENS_COUNTER_BATCH_SIZE` | Батч подсчёта токенов | `16` |
+| `EXACT_DEDUP_TASKS_DEFAULT` | Задачи exact dedup по тексту; `finder_workers = tasks // 2` | `2` |
+| `CLASSIFICATION_BATCH_SIZE` | Батч EDU/DCLM (шаг 6) | `8` |
+| `CLASSIFICATION_BATCH_TIMEOUT_SEC` | Ожидание наполнения батча | `10.0` |
+| `CLASSIFICATION_MAX_CONTEXT` | Макс. длина контекста классификаторов | `1024` |
+| `CLASSIFICATION_MAX_CONCURRENT_GENERATIONS` | Параллельные генерации (шаг 6) | `2` |
+| `CLASSIFICATION_MAX_CONCURRENT_DOCUMENTS` | Документов в очереди инференса | `2` |
+| `MINHASH_LINES_TO_BUFFER` | Буфер MinHash (меньше → меньше RAM) | `500` |
+
+**Аргумент командной строки**
+
+| Параметр | За что отвечает | По умолчанию |
+|----------|-----------------|--------------|
+| `--gpus` | Число GPU для RolmOCR (шаг 3) и EDU/DCLM (шаг 6) | `1` |
+
+На 8 ГБ без видеокарты шаги 3 (RolmOCR), 4 (Qwen) и 6 (классификаторы) с большой вероятностью не запустятся или упрутся в память; для проверки удобнее маленький `LIMIT` и шаги 1–2.
+
+**Вспомогательные процессы (не в таблице выше)**
+
+| Место | Параметр | Значение |
+|-------|----------|----------|
+| `pipeline_utils/extract_utils.py` | `ProcessPoolExecutor(max_workers=…)` для подготовки страниц RolmOCR | `1` |
+| `pipeline_utils/postprocess_utils.py` | `ProcessPoolExecutor(max_workers=…)` для рендера страниц под Qwen | `1` |
+
+**MinHash (шаг 7):** число `tasks` и `WORKERS` считается автоматически от числа входных `.jsonl.gz` и `MINHASH_CONFIG.num_buckets` (32) — отдельной константы нет; при малом объёме данных получится мало параллелизма.
+
+Чтобы ускорить прогон на сервере, увеличивайте в первую очередь `LIMIT`, `HTTP_FETCH_WORKERS`, `max_concurrent_generations` для OCR/Qwen и `--gpus`.
+
+---
+
+## Как запустить проект (пошагово)
+
+Этот раздел — практическая инструкция для Windows. Подробности по каждому шагу пайплайна — в разделах выше.
+
+### Что понадобится
+
+| Требование | Зачем |
+|------------|--------|
+| **Python 3.12** | В `pyproject.toml` указано `requires-python >= 3.12` |
+| **Интернет** | Common Crawl (S3/HTTP), при необходимости — модели с Hugging Face |
+| **~1–2 ГБ свободного места** | Зависимости + кэш моделей (отдельно от `./finepdfs/data/`) |
+| **~30–80 МБ в проекте** | Данные при `LIMIT = 15` (см. раздел про производительность) |
+| **Git** | Нужен для `uv sync` (зависимость `datatrove` из GitHub) |
+
+**Видеокарта NVIDIA** нужна для RolmOCR, Qwen и классификаторов EDU/DCLM. На ПК **без GPU** (например i3-6100, 8 ГБ RAM) реалистично пройти шаги 1–2 и частично Docling; шаги с vLLM часто падают по памяти или не стартуют.
+
+Файл модели для шага 2:
+
+`./models/xgb_ocr_classifier/xgb_classifier.ubj`
+
+---
+
+### Шаг 0. Открыть терминал в папке проекта
+
+```powershell
+cd C:\Users\rasinski\Desktop\finepdfs-main
+```
+
+(подставьте свой путь к репозиторию)
+
+---
+
+### Шаг 1. Установить Python и pip
+
+1. Скачайте **Python 3.12**: https://www.python.org/downloads/
+2. В установщике включите **«Add python.exe to PATH»** и компонент **pip**.
+3. Закройте и снова откройте PowerShell.
+
+Проверка:
+
+```powershell
+py -0p
+py -3.12 --version
+py -3.12 -m pip --version
+```
+
+Если команда `pip` не находится (`pip is not recognized`) — это нормально для Windows. Используйте всегда:
+
+```powershell
+py -3.12 -m pip ...
+```
+
+а не просто `pip ...`.
+
+---
+
+### Шаг 2. Установить зависимости проекта
+
+**Рекомендуется на Windows (без GPU):** один скрипт в корне проекта:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+Скрипт задаёт флаги MSVC для сборки `fasttext`, создаёт `.venv` и выполняет `uv sync` **без** `vllm` / `flash-attn` (на Windows они не поддерживаются).
+
+**Вручную** (то же самое):
+
+```powershell
+py -3.12 -m pip install uv
+uv venv -p 3.12
+$env:CL = "/std:c++17 /Dssize_t=intptr_t"
+$env:CXXFLAGS = "/std:c++17"
+uv sync --no-build-isolation-package fasttext-numpy2-wheel
+```
+
+**Ошибка `fasttext` / `string_view` / `ssize_t`:** нужны Build Tools и переменные `$env:CL` / `$env:CXXFLAGS` как выше (скрипт `install.ps1` делает это сам).
+
+**GPU-пакеты (только Linux + NVIDIA):** `uv sync --extra gpu` — не запускайте на обычном Windows.
+
+После успешной установки:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -c "import datatrove; print('ok')"
+```
+
+---
+
+### Шаг 3. Запустить пайплайн
+
+**Минимальная команда** (один crawl, до ~15 строк индекса):
+
+```powershell
 python run_finepdfs_pipeline.py --crawl-ids CC-MAIN-2023-06
 ```
 
-Запуск с ограничением языков (после постпроцессинга будут выбраны только эти `language_bucket`):
+**С ограничением языка** (меньше работы на шагах 5–8):
 
-```bash
-python run_finepdfs_pipeline.py --crawl-ids CC-MAIN-2023-06 --languages eng_Latn,rus_Cyrl --gpus 1
+```powershell
+python run_finepdfs_pipeline.py --crawl-ids CC-MAIN-2023-06 --languages rus_Cyrl
 ```
+
+**Параметры командной строки:**
+
+| Параметр | Обязательный | Пример | Смысл |
+|----------|--------------|--------|--------|
+| `--crawl-ids` | да | `CC-MAIN-2023-06` | ID обхода Common Crawl (можно несколько через запятую) |
+| `--languages` | нет | `rus_Cyrl,eng_Latn` | Оставить только эти `language_bucket` после GlotLID |
+| `--gpus` | нет (по умолчанию `1`) | `0` или `1` | Число GPU для RolmOCR и EDU/DCLM |
+
+`HF_TOKEN` для обычного локального прогона **не нужен** (на Hub ничего не отправляется).
+
+---
+
+### Шаг 4. Где смотреть результат
+
+Все основные данные пишутся **локально** в `./finepdfs/data/`:
+
+| Что | Папка |
+|-----|--------|
+| Скачанные PDF (сжатые) | `./finepdfs/data/pdf/` |
+| Списки документов, dedup | `./finepdfs/data/split_truncation/`, `content_dedup/` |
+| Извлечённый текст | `non_ocr_docs_extracted/`, `ocr_docs_extracted/` |
+| После постпроцессинга | `./finepdfs/data/postprocessed/` |
+| **Финальный выход** | `./finepdfs/data/minhash/per_language/{язык}/output/` |
+
+Данные **не загружаются в интернет** автоматически (шаг push на Hub отключён). Из сети **читаются** индекс и PDF Common Crawl, при первом запуске могут **скачиваться** модели в кэш Hugging Face (`~/.cache/` или аналог).
+
+---
+
+### Шаг 5. Как остановить
+
+В окне терминала, где идёт скрипт:
+
+1. **`Ctrl + C`** — корректная остановка.
+2. Если не реагирует — ещё раз **`Ctrl + C`** или завершить `python.exe` в диспетчере задач.
+
+Повторный запуск **начинает пайплайн с начала**, а не с места остановки. Уже записанные файлы в `./finepdfs/data/` останутся на диске.
+
+---
+
+### Шаг 6. Типичные ошибки при запуске
+
+| Сообщение | Что делать |
+|-----------|------------|
+| `pip is not recognized` | Использовать `py -3.12 -m pip install ...` |
+| `python is not recognized` | Установить Python 3.12 с PATH или использовать `py -3.12` |
+| `git is not recognized` | Установить Git: https://git-scm.com/download/win |
+| `Unable to locate credentials` / `Access Denied` на S3 | С домашнего ПК Common Crawl нужно читать по **HTTPS**, не S3. По умолчанию так и настроено; не ставьте `FINEPDFS_CC_USE_S3=1` без AWS |
+| `No files found on .../split_truncation/truncated` | Шаг 1 не нашёл PDF (в логе: `dropped: N` у первого фильтра). Увеличьте `LIMIT` или смените краул |
+| `404` / `.commoncrawl.org/crawl-data/...` на шаге 2 | Битый путь WARC в jsonl (HTTPS). Обновите `blocks/readers/warc_reparse.py` и перезапустите шаг 1 |
+| `Set tasks=finder_workers` на шаге 2 | `finder_workers` и `tasks` у dedup должны совпадать; на слабом ПК в коде `EXACT_CONTENT_DEDUP_FINDER_WORKERS = 1`. Удалите `finepdfs/data/content_dedup/.../sigs` и перезапустите |
+| Кракозябры / `UnicodeEncodeError` в логах | Запуск через `run.ps1` или `$env:PYTHONUTF8="1"` перед `python` |
+| Ошибка при `uv sync` / `flash-attn` | Ожидаемо на ПК без NVIDIA GPU; нужен другой способ установки или сервер с GPU |
+| Нет `xgb_classifier.ubj` / XGBoost `str[0] == '{' (v vs. {)` | Файл ~131 байт — это **Git LFS**, не модель. Выполните `git lfs pull --include=models/xgb_ocr_classifier/xgb_classifier.ubj` (нужен ~258 KB). Без модели пайплайн помечает все PDF как «не скан» |
+| `feature_names mismatch` (модель 8 страниц, в данных 2) | В `run_finepdfs_pipeline.py` должно быть `OCR_PREDICTOR_NUM_PAGES_TO_SAMPLE = 8`, не 2. Удалите `finepdfs/data/content_dedup` и перезапустите шаг 2 |
+| `Unable to read the model: models/heron/heron_int8_quant.xml` / `Expected ":", found "https"` | Файлы heron (~130 байт) — **Git LFS**. `git lfs pull --include=models/heron/*` (xml ~2 MB, bin ~50 MB) |
+| `Please install vllm` / RolmOCR | На Windows CPU **нормально**: vLLM нужен Linux+NVIDIA. Используйте `run.ps1` (`FINEPDFS_SKIP_GPU_STEPS=1`) или `--gpus 0`. Docling (CPU) работает после `git lfs pull` для heron |
+| `UnicodeDecodeError` / `charmap` при шаге 4, jsonl «corrupted» | Docling пишет UTF-8; на Windows `JsonlReader` читал cp1252. В `main()` включён патч UTF-8; перезапустите скрипт (перекачивать jsonl не нужно) |
+| `No files found on .../output_ocr` на шаге 5 | На CPU без RolmOCR папка `output_ocr` пустая — нормально. Обновлённый скрипт читает только `output_docling`, если OCR не было |
+| После `--languages rus_Cyrl` пусто в `glotlid` | PDF оказался на другом языке (в логе шага 4 часто `en`). Уберите фильтр языка или смените `--languages` / `LIMIT` / краул |
+| Падение на vLLM / RolmOCR / Qwen | Нет подходящей GPU или мало VRAM/RAM; см. раздел «Параметры производительности» |
+
+---
+
+### Краткая шпаргалка (копировать)
+
+```powershell
+cd C:\Users\rasinski\Desktop\finepdfs-main
+powershell -ExecutionPolicy Bypass -File install.ps1
+powershell -ExecutionPolicy Bypass -File run.ps1 --crawl-ids CC-MAIN-2023-06 --languages rus_Cyrl
+```
+
+Остановка: **`Ctrl + C`**.
 
 ---
 
@@ -801,9 +1076,8 @@ python run_finepdfs_pipeline.py --crawl-ids CC-MAIN-2023-06 --languages eng_Latn
 - **Не качаются PDF (этап 2–3)**: проверь `failed_pdf_fetch/`, таймауты и доступ к `s3://commoncrawl`.
 - **Падает OCR классификатор (этап 5)**: проверь наличие `./models/xgb_ocr_classifier/xgb_classifier.ubj` и `failed_ocr/`.
 - **Падает Docling (этап 4)**: смотри `OUTPUT_NON_OCR_DIR/.../failed/`.
-- **Не стартует vLLM (этап 6/10)**: проверь GPU/драйверы/VRAM, снизь `max_concurrent_generations`.
+- **Не стартует vLLM (шаги 3–4)**: проверь GPU/драйверы/VRAM, снизь `OCR_MAX_CONCURRENT_GENERATIONS_*` или `QWEN_MAX_CONCURRENT_GENERATIONS`.
 - **Нет языкового шардинга (этап 7)**: проверь `thresholds/th_values.json` и наличие `language_bucket`.
 - **Нет моделей EDU/DCLM (этап 8)**: `model_exists()` может возвращать `False` из-за сети/прав; убедись, что HF доступен.
-- **MinHash работает слишком долго (этап 9)**: проверь `WORKERS`, размер данных, `lines_to_buffer`.
-- **Не пушится на Hub (этап 10)**: проверь `HF_TOKEN` и права на `dataset=...`.
+- **MinHash работает слишком долго (шаг 8)**: проверь авто-`WORKERS`, размер данных, `lines_to_buffer` (в коде сейчас `500`).
 

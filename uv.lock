@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12, <4.0"
 resolution-markers = [
     "sys_platform == 'darwin'",
@@ -1585,15 +1585,21 @@ dependencies = [
     { name = "docling" },
     { name = "docling-core" },
     { name = "docling-ibm-models" },
-    { name = "flash-attn" },
     { name = "ipykernel" },
     { name = "libmagic" },
+    { name = "opendataloader-pdf" },
     { name = "openvino" },
     { name = "pymupdf" },
+    { name = "python-magic-bin", marker = "sys_platform == 'win32'" },
     { name = "scikit-learn" },
     { name = "torch" },
-    { name = "vllm" },
     { name = "xgboost" },
+]
+
+[package.optional-dependencies]
+gpu = [
+    { name = "flash-attn" },
+    { name = "vllm" },
 ]
 
 [package.metadata]
@@ -1606,16 +1612,19 @@ requires-dist = [
     { name = "docling", editable = "docling_code/docling" },
     { name = "docling-core", editable = "docling_code/docling-core" },
     { name = "docling-ibm-models", editable = "docling_code/docling-ibm-models" },
-    { name = "flash-attn", specifier = "==2.7.4.post1" },
+    { name = "flash-attn", marker = "extra == 'gpu'", specifier = "==2.7.4.post1" },
     { name = "ipykernel", specifier = ">=6.30.1" },
     { name = "libmagic", specifier = ">=1.0" },
+    { name = "opendataloader-pdf", specifier = ">=2.4.4" },
     { name = "openvino", specifier = ">=2025.3.0" },
     { name = "pymupdf", specifier = "==1.26.1" },
+    { name = "python-magic-bin", marker = "sys_platform == 'win32'", specifier = ">=0.4.14" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
     { name = "torch", specifier = "==2.6.0" },
-    { name = "vllm", specifier = ">=0.8.5.post1" },
+    { name = "vllm", marker = "extra == 'gpu'", specifier = ">=0.8.5.post1" },
     { name = "xgboost", specifier = ">=3.0.5" },
 ]
+provides-extras = ["gpu"]
 
 [[package]]
 name = "flake8"
@@ -3759,6 +3768,15 @@ wheels = [
 ]
 
 [[package]]
+name = "opendataloader-pdf"
+version = "2.4.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/53/d95c69d8db0cd6326d4966fb003367d088002a66c96cac8344cab70be112/opendataloader_pdf-2.4.4.tar.gz", hash = "sha256:606f55b0a714ddac30d08cb30e517d28762056d75f2b90c1f7d74a5ba7737c3d", size = 22545990, upload-time = "2026-05-19T01:49:34.274Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/a9/26965063d52d724af7f6c8283bddd5e626633b64b1e1c65421e9a15740f5/opendataloader_pdf-2.4.4-py3-none-any.whl", hash = "sha256:f25ee3c73d158132b8e1e3f5f0efa513c613f66feabf1013910c2316f253f46c", size = 22560085, upload-time = "2026-05-19T01:49:31.235Z" },
+]
+
+[[package]]
 name = "openpyxl"
 version = "3.1.5"
 source = { registry = "https://pypi.org/simple" }
@@ -4941,6 +4959,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/da/db/0b3e28ac047452d079d375ec6798bf76a036a08182dbb39ed38116a49130/python-magic-0.4.27.tar.gz", hash = "sha256:c1ba14b08e4a5f5c31a302b7721239695b2f0f058d125bd5ce1ee36b9d9d3c3b", size = 14677, upload-time = "2022-06-07T20:16:59.508Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6c/73/9f872cb81fc5c3bb48f7227872c28975f998f3e7c2b1c16e95e6432bbb90/python_magic-0.4.27-py2.py3-none-any.whl", hash = "sha256:c212960ad306f700aa0d01e5d7a325d20548ff97eb9920dcd29513174f0294d3", size = 13840, upload-time = "2022-06-07T20:16:57.763Z" },
+]
+
+[[package]]
+name = "python-magic-bin"
+version = "0.4.14"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5a/5d/10b9ac745d9fd2f7151a2ab901e6bb6983dbd70e87c71111f54859d1ca2e/python_magic_bin-0.4.14-py2.py3-none-win32.whl", hash = "sha256:34a788c03adde7608028203e2dbb208f1f62225ad91518787ae26d603ae68892", size = 397784, upload-time = "2017-10-02T16:30:15.806Z" },
+    { url = "https://files.pythonhosted.org/packages/07/c2/094e3d62b906d952537196603a23aec4bcd7c6126bf80eb14e6f9f4be3a2/python_magic_bin-0.4.14-py2.py3-none-win_amd64.whl", hash = "sha256:90be6206ad31071a36065a2fc169c5afb5e0355cbe6030e87641c6c62edc2b69", size = 409299, upload-time = "2017-10-02T16:30:18.545Z" },
 ]
 
 [[package]]
