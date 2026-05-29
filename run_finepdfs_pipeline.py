@@ -491,14 +491,14 @@ def run_extract(gpus: int = 1):
             "Skipping RolmOCR (vLLM): no GPU / vllm not installed (expected on Windows CPU install).",
             file=sys.stderr,
         )
+    # Non-OCR extraction via OpenDataLoader (Java 11+). Docling: run_finepdfs_pipeline_docling.py
     if not _opendataloader_ready():
         print(
             "Skipping OpenDataLoader PDF: Java 11+ not found on PATH.\n"
             "Install JDK from https://adoptium.net/ and ensure `java -version` works.",
             file=sys.stderr,
         )
-    # Non-OCR extraction (OpenDataLoader PDF; needs Java, no heron/docling models)
-    if _opendataloader_ready():
+    elif _opendataloader_ready():
         for truncation in ["truncated", "non_truncated"]:
             if not _content_dedup_has_inputs(truncation, "non_ocr"):
                 print(
@@ -532,7 +532,9 @@ def run_extract(gpus: int = 1):
                         output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/failed")
                     ),
                 ),
-                JsonlWriter(output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/extracted")),
+                JsonlWriter(
+                    output_folder=OUTPUT_NON_OCR_DIR.format(prefix=f"{truncation}/extracted")
+                ),
             ]
             LocalPipelineExecutor(pipeline_extract).run()
 
@@ -679,7 +681,7 @@ def run_postprocess(gpus: int = 1):
         )
     if not pipeline_docling:
         print(
-            "Skipping step 4 postprocess (OpenDataLoader): no extracted jsonl under "
+            f"Skipping step 4 postprocess (OpenDataLoader): no extracted jsonl under "
             f"{DOCLING_INPUT_DIR}",
             file=sys.stderr,
         )
